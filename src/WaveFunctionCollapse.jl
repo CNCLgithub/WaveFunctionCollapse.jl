@@ -143,11 +143,10 @@ Initializes a `WaveState` from a template wave matrix.
 """
 function WaveState(template::AbstractMatrix{Int64},
                    prop_rules::AbstractMatrix{Float64})
-    ni,nj,nz = findnz(template)
+    ni,nj,nz = findnz(sparse(template))
     collapsed = length(nz)
     r,c = size(template)
     n_htiles = size(prop_rules, 1)
-    weights = fill(1.0 / n_htiles, (n_htiles, r * c))
     weights = ones(n_htiles, r * c)
     entropies = fill(entropy(weights[:, 1]), r * c)
     for (i,j) = zip(ni, nj)
@@ -177,31 +176,20 @@ function propagate!(state::WaveState, cell_id::Int64,
 end
 
 function propagate!(weights, entropies, wave, cell_id, prop_rules)
-    # @show cell_id
     selection = wave[cell_id]
     r, c = size(wave)
     for (ncell, d) in neighbors(r, c, cell_id)
-        # @show ncell
         wave[ncell] == 0 || continue # already collapsed
         hweights = @view weights[:, ncell]
-        # @show hweights
         # convert selection to standard form
         standardized = rotate(selection, d)
         # lookup rules
         rules = prop_rules[:, standardized]
-        # @show rules
         # transform to current orientation
         rules = rotate(rules, -d)
-        # @show selection
-        # @show standardized
-        # @show d
-        # @show rules
         hweights .*= rules
-        # rmul!(hweights, 0.5)
         # re-normalize weights
         rmul!(hweights, 1.0 / sum(hweights))
-        # softmax!(hweights, hweights; t = 0.1) # TODO
-        # @show hweights
         entropies[ncell] = entropy(hweights)
     end
     return nothing
@@ -222,7 +210,6 @@ end
 function collapse_step!(state::WaveState,
                         prop_rules::AbstractMatrix{Float64})
     selected_cell = argmax(state.entropies)
-    # println("collapsed $(selected_cell)")
     collapse_cell!(state, selected_cell)
     propagate!(state, selected_cell, prop_rules)
     state.collapsed += 1
