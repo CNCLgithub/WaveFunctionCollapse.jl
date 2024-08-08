@@ -24,10 +24,19 @@ module WaveFunctionCollapse
 #######################################################################
 
 export HT2D_vec,
+    HT2D,
     WaveState,
     collapse!,
-    gen_prop_rules,
-    expand
+    expand,
+    TileSet,
+    weight,
+    tile_count,
+    update!,
+    Space,
+    relations,
+    GridSpace,
+    GridRelation,
+    neighbors
 
 #######################################################################
 # Dependencies
@@ -52,6 +61,147 @@ using DocStringExtensions
 # struct HyperTile{N} <: HyperTileSpace end
 
 # const HT2 = HyperTile{2}
+
+abstract type Space end
+
+function neighbors end
+
+struct GridSpace <: Space
+    length::Int64
+    size::Tuple{Int64, Int64}
+end
+
+@enum GridRelation begin
+    Above = 1
+    Below = 2
+    Left  = 3
+    Right = 4
+end
+
+relations(::GridSpace) = GridRelation
+
+move(::Val{Above}, gs::GridSpace, i::Int) = i - 1
+move(::Val{Below}, gs::GridSpace, i::Int) = i + 1
+move(::Val{Left}, gs::GridSpace, i::Int) = i - gs.size[1]
+move(::Val{Right}, gs::GridSpace, i::Int) = i + gs.size[1]
+
+function neighbors(gs::GridSpace, i::Int)
+    result = Tuple{Int, GridRelation}[]
+    n = gs.length
+    for r = instances(GridRelation)
+        idx = move(Val(r), gs, i)
+        if checkindex(Bool, 1:n, idx)
+            push!(result, (idx, r))
+        end
+    end
+    return result
+end
+
+function sealed(::Val{Above}, x::T, o::T) where {T<:AbstractMatrix}
+    @assert size(x) == size(o) "Hypertiles must match"
+    col = size(x, 2)
+    sealed = true
+    @inbounds for i = 1:col
+        if x[1, i] != o[end, i]
+            sealed = false
+            break
+        end
+    end
+    return sealed
+end
+
+
+function sealed(::Val{Below}, x::T, o::T) where {T<:AbstractMatrix}
+    @assert size(x) == size(o) "Hypertiles must match"
+    col = size(x, 2)
+    sealed = true
+    @inbounds for i = 1:col
+        if x[end, i] != o[1, i]
+            sealed = false
+            break
+        end
+    end
+    return sealed
+end
+
+function sealed(::Val{Left}, x::T, o::T) where {T<:AbstractMatrix}
+    @assert size(x) == size(o) "Hypertiles must match"
+    row = size(x, 1)
+    sealed = true
+    @inbounds for i = 1:row
+        if x[i, 1] != o[i, end]
+            sealed = false
+            break
+        end
+    end
+    return sealed
+end
+
+
+function sealed(::Val{Right}, x::T, o::T) where {T<:AbstractMatrix}
+    @assert size(x) == size(o) "Hypertiles must match"
+    row = size(x, 1)
+    sealed = true
+    @inbounds for i = 1:row
+        if x[i, end] != o[i, 1]
+            sealed = false
+            break
+        end
+    end
+    return sealed
+end
+
+
+struct TileSet{T}
+    tiles::Array{T}
+    tile_map::Dict{T, Int}
+    weights::Array{Float64, 3}
+end
+
+function TileSet(tiles::Array{T}, sp::GridSpace) where {T<:AbstractMatrix}
+    nt = length(tiles)
+    rs = instances(GridRelation)
+    nr = length(rs)
+    weights = Array{Float64, 3}(undef, nt, nt, nr)
+    for i = 1:nt, j = 1:nt, r = 1:nr
+        # ex: count when `j` is above `i`
+        weights[j, i, r] = sealed(Val(rs[r]), tiles[i], tiles[j])
+    end
+    TileSet(tiles, weights)
+end
+
+function TileSet(tiles::Array{T}, ws::Array{Float64, 3}) where {T}
+    TileSet{T}(tiles, Dict(zip(tiles, 1:length(tiles))), ws)
+end
+
+function weight(ts::TileSet{T}, x::T, y::T) where {T}
+    xid = ts.tile_map[x]
+    yid = ts.tile_map[y]
+    weight(ts, xid, yid)
+end
+
+function weight(ts::TileSet, x::Int, y::Int)
+    ts.weights[x, y]
+end
+
+tile_count(ts::TileSet) = length(ts.tiles)
+
+# update!(nweights, ts, selection, rel) # TODO
+function update!(weights, ts::TileSet, sel::Int, rel::Enum)
+    relidx = Int(rel)
+    mass = 0.0
+    for i = eachindex(weights)
+        v = min(weights[i], ts.weights[i, sel, relidx])
+        weights[i] = v
+        mass += v
+    end
+    if mass < 1E-4
+        fill!(weights, 0.0)
+    else
+        rmul!(weights, 1.0 / mass)
+    end
+    return nothing
+end
 
 #######################################################################
 # Constants
@@ -87,31 +237,7 @@ const HT2D_vec = Vector{HT2D}([
     HT2D(trues(2,2))
 ])
 
-const _ht2_hash_map = Dict(zip(HT2D_vec, collect(1:length(HT2D_vec))))
-
 #######################################################################
-# Methods
-#######################################################################
-
-# TODO: generalize
-"""
-    $(SIGNATURES)
-
-Generates a propagation weight matrix for the 2D hypertile space.
-"""
-function gen_prop_rules()
-    n = length(HT2D_vec)
-    ws = zeros(n, n)
-    for (i, hti) = enumerate(HT2D_vec)
-        ni = count(hti)
-        for (j,  htj) = enumerate(HT2D_vec)
-            nj = count(htj)
-            ws[i, j] = ((hti[3] == htj[1]) + (hti[4] == htj[2])) /
-                    ((1+nj)^2)
-        end
-    end
-    return ws
-end
 
 """
 The state describing a step in the collapse process
@@ -130,8 +256,8 @@ mutable struct WaveState
     weights::Matrix{Float64}
     "The entropy of each index in the wave"
     entropies::Vector{Float64}
-    "A matrix of collapsed hyper tiles. `0` denotes a non-collapsed cell"
-    wave::Matrix{Int64} # 0 - uninitialized
+    "A vector of collapsed hyper tiles. `0` denotes a non-collapsed cell"
+    wave::AbstractArray{Int64} # 0 - uninitialized
     "The number of collapsed cells"
     collapsed::Int64
 end
@@ -142,12 +268,13 @@ end
 Initializes a `WaveState` from a template wave matrix.
 """
 function WaveState(template::AbstractMatrix{Int64},
-                   prop_rules::AbstractMatrix{Float64})
+                   sp::GridSpace,
+                   ts::TileSet)
     ni,nj,nz = findnz(sparse(template))
     collapsed = length(nz)
     r,c = size(template)
-    n_htiles = size(prop_rules, 1)
-    weights = ones(n_htiles, r * c)
+    tc = tile_count(ts)
+    weights = ones(tc, r * c)
     entropies = fill(entropy(weights[:, 1]), r * c)
     for (i,j) = zip(ni, nj)
         htile_id = template[i, j]
@@ -157,7 +284,7 @@ function WaveState(template::AbstractMatrix{Int64},
         fill!(hweights, 0.0)
         hweights[htile_id] = 1.0
         entropies[lin_idx] = 0.0
-        propagate!(weights, entropies, template, lin_idx, prop_rules)
+        propagate!(weights, entropies, template, lin_idx, sp, ts)
     end
 
     WaveState(weights, entropies, template, collapsed)
@@ -170,27 +297,22 @@ end
 Propagates effects driven by collapsing a given cell.
 """
 function propagate!(state::WaveState, cell_id::Int64,
-                    prop_rules::AbstractMatrix{Float64})
+                    sp::Space, ts::TileSet)
     propagate!(state.weights, state.entropies, state.wave,
-               cell_id, prop_rules)
+               cell_id, sp, ts)
 end
 
-function propagate!(weights, entropies, wave, cell_id, prop_rules)
+function propagate!(weights, entropies, wave, cell_id, sp, ts)
     selection = wave[cell_id]
     r, c = size(wave)
-    for (ncell, d) in neighbors(r, c, cell_id)
+    for (ncell, rel) in neighbors(sp, cell_id)
         wave[ncell] == 0 || continue # already collapsed
-        hweights = @view weights[:, ncell]
-        # convert selection to standard form
-        standardized = rotate(selection, d)
-        # lookup rules
-        rules = prop_rules[:, standardized]
-        # transform to current orientation
-        rules = rotate(rules, -d)
-        hweights .*= rules
-        # re-normalize weights
-        rmul!(hweights, 1.0 / sum(hweights))
-        entropies[ncell] = entropy(hweights)
+        # weigths to update
+        nweights = @view weights[:, ncell]
+        # integrate prop rules
+        update!(nweights, ts, selection, rel)
+        # update entropy
+        entropies[ncell] = entropy(nweights)
     end
     return nothing
 end
@@ -207,11 +329,10 @@ function collapse_cell!(state::WaveState, cell_id::Int64)
     return nothing
 end
 
-function collapse_step!(state::WaveState,
-                        prop_rules::AbstractMatrix{Float64})
+function collapse_step!(state::WaveState, sp::Space, ts::TileSet)
     selected_cell = argmax(state.entropies)
     collapse_cell!(state, selected_cell)
-    propagate!(state, selected_cell, prop_rules)
+    propagate!(state, selected_cell, sp, ts)
     state.collapsed += 1
     return nothing
 end
@@ -221,11 +342,10 @@ end
 
 Iteralively collapses `state`. The resulting wave can be instantiated via [`expand`](@ref).
 """
-function collapse!(state::WaveState,
-                   prop_rules::AbstractMatrix{Float64})
+function collapse!(state::WaveState, sp::Space, ts::TileSet)
     n = length(state.wave)
     while state.collapsed < n
-        collapse_step!(state, prop_rules)
+        collapse_step!(state, sp, ts)
     end
     return nothing
 end
@@ -237,53 +357,22 @@ end
 """
     $(TYPEDSIGNATURES)
 
-Instantiates the binary matrix defined in `state.wave`.
+Converts the wave into dense collection
 """
-function expand(state::WaveState)
-    r, c = size(state.wave)
-    result = Matrix{Bool}(undef, r * 2, c * 2)
+function expand(state::WaveState, sp::GridSpace,
+                ts::TileSet{<:AbstractMatrix{T}}) where {T}
+    dims = (r,c) = sp.size
+    imat = reshape(state.wave, dims)
+    er, ec = size(ts.tiles[1])
+    result = Matrix{T}(undef, r * er, c * ec)
     for ir = 1:r, ic = 1:c
-        row_start = (ir - 1) * 2 + 1
-        row_end = ir * 2
-        col_start = (ic - 1) * 2 + 1
-        col_end = ic * 2
-        result[row_start:row_end, col_start:col_end] = HT2D_vec[state.wave[ir, ic]]
-    end
-    return result
-end
-
-
-const _neighbhors = [((0, -1), 0),
-                     ((-1, 0), 3),
-                     ((1, 0),  1),
-                     ((0, 1),  2)]
-function neighbors(r::Int64, c::Int64, cell_id::Int64)
-    cell_row = ((cell_id - 1) % r) + 1
-    cell_col = ceil(Int64, cell_id / r)
-    ch = Channel{NTuple{2, Int64}}() do ch
-        for ((shift_r, shift_c), d) in _neighbhors
-            n_row = cell_row + shift_r
-            n_col = cell_col + shift_c
-            ((n_row < 1 || n_row > r) ||
-                (n_col < 1 || n_col > c)) &&
-                continue
-            idx = (n_col - 1) * r + n_row
-            put!(ch, (idx, d))
-        end
-    end
-end
-
-# TODO: remove intermediate step
-function rotate(i::Int64, r::Int64)
-    htile = HT2D_vec[i]
-    rotated = rotl90(htile, r)
-    _ht2_hash_map[rotated]
-end
-
-function rotate(v::AbstractVector{Float64}, r::Int64)
-    result = Vector{Float64}(undef, length(v))
-    for i = eachindex(v)
-        result[rotate(i, r)] = v[i]
+        row_start = (ir - 1) * er + 1
+        row_end = ir * er
+        col_start = (ic - 1) * ec + 1
+        col_end = ic * ec
+        lidx = ir + (ic - 1) * c
+        result[row_start:row_end, col_start:col_end] =
+            ts.tiles[state.wave[lidx]]
     end
     return result
 end
@@ -300,14 +389,14 @@ function entropy(a::AbstractArray{Float64})
     -1.0 * result
 end
 
-function softmax(x::AbstractArray{Float64}; t::Float64 = 1.0)
+function softmax(x::AbstractArray{Float64}, t::Float64 = 1.0)
     out = similar(x)
-    softmax!(out, x; t = t)
+    softmax!(out, x, t)
     return out
 end
 
 function softmax!(out::AbstractArray{Float64},
-                  x::AbstractArray{Float64}; t::Float64 = 1.0)
+                  x::AbstractArray{Float64}, t::Float64 = 1.0)
     nx = length(x)
     maxx = maximum(x)
     sxs = 0.0
