@@ -320,6 +320,10 @@ end
 function collapse_cell!(state::WaveState, cell_id::Int64)
     hweights = state.weights[:, cell_id]
     # sample hyper tile
+    if isapprox(sum(hweights), 0.0)
+        display(state.wave)
+        error("Impossible state for cell $(cell_id)")
+    end
     htile_id = rand(Categorical(hweights))
     state.wave[cell_id] = htile_id
     # update weights and entropy
